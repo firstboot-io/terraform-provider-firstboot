@@ -150,3 +150,7 @@ To try the provider against a local build, use a `dev_overrides` block in
 `~/.terraformrc` pointing `firstboot-io/firstboot` at your `GOBIN`. Note that
 `terraform init` is skipped under `dev_overrides`; run `plan` and `apply`
 directly.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
