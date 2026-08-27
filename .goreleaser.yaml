@@ -1,0 +1,66 @@
+# What the Terraform registry needs, which is more than "a binary somewhere".
+#
+# The registry does not build anything: it reads a GitHub release and expects a
+# precise shape --- one zip per platform named after the provider and version, a
+# SHA256SUMS file, a detached GPG signature over that file made by a key whose
+# public half is registered, and the protocol manifest beside them. Any one of
+# those missing and the version is rejected without a useful reason, so this file
+# is copied from HashiCorp's own template rather than invented here.
+version: 2
+
+# Set explicitly, and not left to be inferred: the local checkout directory is
+# `terraform-provider`, while the repository, the module and every artifact name
+# are `terraform-provider-firstboot`. Inferring would name the artifacts after
+# the directory somebody happened to clone into.
+project_name: terraform-provider-firstboot
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    flags:
+      - -trimpath
+    ldflags:
+      - '-s -w -X main.version={{.Version}}'
+    goos: [freebsd, windows, linux, darwin]
+    goarch: ['386', amd64, arm, arm64]
+    ignore:
+      - goos: darwin
+        goarch: '386'
+    # The registry resolves a provider binary by this exact name, version
+    # included. A plain `terraform-provider-firstboot` is not found.
+    binary: '{{ .ProjectName }}_v{{ .Version }}'
+
+archives:
+  - formats: [zip]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+
+checksum:
+  name_template: '{{ .ProjectName }}_{{ .Version }}_SHA256SUMS'
+  algorithm: sha256
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
+
+signs:
+  - artifacts: checksum
+    args:
+      - --batch
+      - -u
+      - '{{ .Env.GPG_FINGERPRINT }}'
+      - --output
+      - '${signature}'
+      - --detach-sign
+      - '${artifact}'
+
+release:
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
+
+changelog:
+  disable: true

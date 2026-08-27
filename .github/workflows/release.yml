@@ -1,0 +1,47 @@
+name: release
+
+# A tag is the whole trigger, and the artifacts it produces are what the
+# Terraform registry reads. The registry never builds a provider; it verifies a
+# signature over what this job uploaded, so a release made by hand on somebody's
+# laptop is a release signed by whatever key that laptop had.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with: {go-version: '1.25'}
+      - name: reach the SDK module
+        env:
+          SDK_READ_TOKEN: ${{ secrets.SDK_READ_TOKEN }}
+        run: |
+          if [ -n "$SDK_READ_TOKEN" ]; then
+            git config --global \
+              url."https://x-access-token:${SDK_READ_TOKEN}@github.com/firstboot-io/".insteadOf \
+              "https://github.com/firstboot-io/"
+            echo "GOPRIVATE=github.com/firstboot-io/*" >> "$GITHUB_ENV"
+          fi
+      # The signing key lives here and nowhere else. Its public half is uploaded
+      # to the registry once; the registry then refuses any version this key did
+      # not sign, which is the whole point of it.
+      - uses: crazy-max/ghaction-import-gpg@v6
+        id: import_gpg
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}

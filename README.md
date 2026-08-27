@@ -183,15 +183,63 @@ go build ./...
 go test ./...
 ```
 
-The SDK is consumed from the sibling checkout through a `replace` directive
-until it is published. The acceptance tests are not written yet: they need a
-real account and spend real money, so they are their own decision rather than
-something to add quietly.
+The SDK is consumed as a released module (`github.com/firstboot-io/go-sdk`),
+not as a sibling checkout: the `replace` directive is gone. While that
+repository is private the module proxy cannot serve it, so a build needs
+
+```
+go env -w GOPRIVATE='github.com/firstboot-io/*'
+git config --global url."git@github.com:firstboot-io/".insteadOf "https://github.com/firstboot-io/"
+```
+
+once, and nothing after the repositories go public.
+
+The acceptance tests are not written yet: they need a real account and spend real
+money, so they are their own decision rather than something to add quietly.
 
 To try the provider against a local build, use a `dev_overrides` block in
 `~/.terraformrc` pointing `firstboot-io/firstboot` at your `GOBIN`. Note that
 `terraform init` is skipped under `dev_overrides`; run `plan` and `apply`
 directly.
+
+## Releasing
+
+The registry builds nothing. It reads a GitHub release and refuses the version
+unless the shape is exact, so the release is made by CI from a tag and never by
+hand:
+
+```
+git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0
+```
+
+That runs `.github/workflows/release.yml`, which imports the signing key and
+lets goreleaser produce one zip per platform, a `SHA256SUMS` file, a detached
+signature over it, and `terraform-registry-manifest.json` beside them.
+
+Three things have to exist first, and all three are one-time:
+
+| What | Where | Why |
+|---|---|---|
+| A GPG signing key | `GPG_PRIVATE_KEY` and `PASSPHRASE` secrets, public half uploaded to the registry | The registry verifies every version against the key you registered, and rejects one it did not sign |
+| `SDK_READ_TOKEN` | Repository secret, read access to `firstboot-io/go-sdk` | The SDK is a private module; without it the release cannot resolve its own dependency. Unnecessary once the repositories are public |
+| A public repository named `terraform-provider-firstboot` | GitHub | The registry derives the provider name from the part after the prefix and will not look at a private one |
+
+Generate the key with `gpg --full-generate-key` (RSA 4096, no expiry is fine for
+a signing key you control), export the private half with `gpg
+--armor --export-secret-keys <id>` into the secret, and upload `gpg --armor
+--export <id>` to the registry under **Settings → Signing keys**.
+
+`docs/` is generated from the schema by
+[tfplugindocs](https://github.com/hashicorp/terraform-plugin-docs) and is what
+the registry renders as the provider's page:
+
+```
+go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@v0.25.0 \
+  generate --provider-name firstboot --rendered-provider-name Firstboot
+```
+
+CI runs the same command and fails on a diff, so a schema change with stale docs
+does not reach the registry.
 
 ## License
 

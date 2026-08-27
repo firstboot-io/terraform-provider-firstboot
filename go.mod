@@ -2,13 +2,8 @@ module github.com/firstboot-io/terraform-provider-firstboot
 
 go 1.25.7
 
-// The SDK is not published yet; it is checked out as a sibling of this
-// repository, exactly as the workspace layout describes. Remove this the day
-// the SDK carries a tag.
-replace github.com/firstboot-io/go-sdk => ../go-sdk
-
 require (
-	github.com/firstboot-io/go-sdk v0.0.0-00010101000000-000000000000
+	github.com/firstboot-io/go-sdk v0.1.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
 )

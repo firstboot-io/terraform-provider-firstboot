@@ -9,19 +9,60 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { path: terraform-provider-firstboot }
-      # The SDK is consumed through a replace directive until it is published,
-      # so it has to be beside this checkout for anything here to build.
-      - uses: actions/checkout@v4
-        with:
-          repository: firstboot-io/firstboot-go
-          path: firstboot-go
-          token: ${{ secrets.SDK_READ_TOKEN }}
       - uses: actions/setup-go@v5
         with: { go-version: '1.25' }
-      - working-directory: terraform-provider-firstboot
+      # The SDK is consumed as a released module, not as a sibling checkout. It
+      # is still a private repository, so the module proxy cannot serve it and
+      # the fetch has to go straight to GitHub with a token. Both halves are
+      # conditional on the secret existing: the day the repositories go public
+      # this step does nothing and the proxy and checksum database take over,
+      # which is the outcome to prefer rather than one to work around.
+      - name: reach the SDK module
+        env:
+          SDK_READ_TOKEN: ${{ secrets.SDK_READ_TOKEN }}
         run: |
-          go build ./...
-          go vet ./...
-          go test ./...
+          if [ -n "$SDK_READ_TOKEN" ]; then
+            git config --global \
+              url."https://x-access-token:${SDK_READ_TOKEN}@github.com/firstboot-io/".insteadOf \
+              "https://github.com/firstboot-io/"
+            echo "GOPRIVATE=github.com/firstboot-io/*" >> "$GITHUB_ENV"
+          else
+            echo "no SDK_READ_TOKEN set; fetching the SDK as a public module"
+          fi
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+      - name: gofmt
+        run: |
           out=$(gofmt -l .); if [ -n "$out" ]; then echo "not gofmt-clean:"; echo "$out"; exit 1; fi
+
+  docs:
+    # The registry renders `docs/` as the provider's page and regenerates
+    # nothing on the way. A schema change with a stale `docs/` therefore ships
+    # documentation that describes attributes the provider no longer has, and
+    # nobody finds out from the provider. The diff is the gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.25' }
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: reach the SDK module
+        env:
+          SDK_READ_TOKEN: ${{ secrets.SDK_READ_TOKEN }}
+        run: |
+          if [ -n "$SDK_READ_TOKEN" ]; then
+            git config --global \
+              url."https://x-access-token:${SDK_READ_TOKEN}@github.com/firstboot-io/".insteadOf \
+              "https://github.com/firstboot-io/"
+            echo "GOPRIVATE=github.com/firstboot-io/*" >> "$GITHUB_ENV"
+          fi
+      - run: |
+          go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@v0.25.0 \
+            generate --provider-name firstboot --rendered-provider-name Firstboot
+          git diff --exit-code -- docs/ || {
+            echo "::error::docs/ is behind the provider schema; run tfplugindocs and commit"
+            exit 1
+          }
