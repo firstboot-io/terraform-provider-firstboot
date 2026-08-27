@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"net/http"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -32,6 +34,7 @@ type serverModel struct {
 	Image          types.String `tfsdk:"image"`
 	Region         types.String `tfsdk:"region"`
 	ProjectID      types.String `tfsdk:"project_id"`
+	Tags           types.Set    `tfsdk:"tags"`
 	NetworkID      types.String `tfsdk:"network_id"`
 	FirewallID     types.String `tfsdk:"firewall_id"`
 	SSHKeyIDs      types.List   `tfsdk:"ssh_key_ids"`
@@ -103,10 +106,8 @@ func (r *serverResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"project_id": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "Optional project to group the server under. Changing it moves the server; it is not a replacement.",
-			},
+			"tags":       tagsAttribute("server"),
+			"project_id": projectAttribute("server"),
 			"network_id": schema.StringAttribute{
 				Optional: true,
 				MarkdownDescription: "Optional private network to join at creation, which assigns a private address.\n\n" +
@@ -200,6 +201,10 @@ func (r *serverResource) Create(ctx context.Context, req resource.CreateRequest,
 	if v := plan.ProjectID.ValueString(); v != "" {
 		body.ProjectId = &v
 	}
+	body.Tags = tagsFromPlan(ctx, plan.Tags, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	if v := plan.NetworkID.ValueString(); v != "" {
 		body.NetworkId = &v
 	}
@@ -233,7 +238,7 @@ func (r *serverResource) Create(ctx context.Context, req resource.CreateRequest,
 	}
 
 	srv := &out.JSON202.Server
-	applyServer(&plan, srv)
+	applyServer(ctx, &plan, srv, &resp.Diagnostics)
 	// State is written BEFORE the wait. If the wait then fails or the operator
 	// interrupts it, Terraform still knows the server exists -- without this,
 	// an interrupted apply leaves a running, billing machine that no state file
@@ -251,7 +256,7 @@ func (r *serverResource) Create(ctx context.Context, req resource.CreateRequest,
 		waitError(&resp.Diagnostics, "Waiting for the server", err)
 		return
 	}
-	applyServer(&plan, settled)
+	applyServer(ctx, &plan, settled, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -275,7 +280,7 @@ func (r *serverResource) Read(ctx context.Context, req resource.ReadRequest, res
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyServer(&state, out.JSON200)
+	applyServer(ctx, &state, out.JSON200, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -306,22 +311,26 @@ func (r *serverResource) Update(ctx context.Context, req resource.UpdateRequest,
 		}
 	}
 
-	if !plan.ProjectID.Equal(state.ProjectID) {
-		var pid *string
-		if v := plan.ProjectID.ValueString(); v != "" {
-			pid = &v
-		}
-		out, err := r.client.API.ServerProjectSetWithResponse(ctx, id,
-			fbapi.ServerProjectSetJSONRequestBody{ProjectId: pid})
-		if err != nil {
-			apiError(&resp.Diagnostics, "Moving the server between projects", err)
-			return
-		}
-		if out.StatusCode() >= 400 {
-			apiError(&resp.Diagnostics, "Moving the server between projects",
-				problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
-			return
-		}
+	if !applyGrouping(ctx, &resp.Diagnostics, groupingUpdate{
+		Noun: "server", PlanTags: plan.Tags, StateTags: state.Tags,
+		PlanProject: plan.ProjectID, StateProject: state.ProjectID,
+		SetTags: func(ctx context.Context, b fbapi.TagsBody) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.ServerTagsSetWithResponse(ctx, id, b)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+		SetProject: func(ctx context.Context, pid *string) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.ServerProjectSetWithResponse(ctx, id,
+				fbapi.ServerProjectSetJSONRequestBody{ProjectId: pid})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+	}) {
+		return
 	}
 
 	if !plan.Plan.Equal(state.Plan) {
@@ -357,7 +366,7 @@ func (r *serverResource) Update(ctx context.Context, req resource.UpdateRequest,
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyServer(&plan, out.JSON200)
+	applyServer(ctx, &plan, out.JSON200, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -398,7 +407,7 @@ func (r *serverResource) ImportState(ctx context.Context, req resource.ImportSta
 			"`ignore_changes` lifecycle block for them after checking the plan.")
 }
 
-func applyServer(m *serverModel, b *fbapi.ServerBody) {
+func applyServer(ctx context.Context, m *serverModel, b *fbapi.ServerBody, diags *diag.Diagnostics) {
 	m.ID = types.StringValue(b.Id)
 	m.Code = types.StringValue(b.Code)
 	m.Name = types.StringValue(b.Name)
@@ -420,6 +429,9 @@ func applyServer(m *serverModel, b *fbapi.ServerBody) {
 	} else {
 		m.ProjectID = types.StringNull()
 	}
+	// Tags are refreshed for the same reason project_id is: the API returns
+	// them, so a tag added in the panel is real drift.
+	applyTags(ctx, &m.Tags, b.Tags, diags)
 }
 
 // listRequiresReplace is RequiresReplace for a list attribute. The framework

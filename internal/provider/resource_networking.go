@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -487,6 +488,7 @@ type dnsZoneModel struct {
 	ID          types.String `tfsdk:"id"`
 	Name        types.String `tfsdk:"name"`
 	ProjectID   types.String `tfsdk:"project_id"`
+	Tags        types.Set    `tfsdk:"tags"`
 	Nameservers types.List   `tfsdk:"nameservers"`
 	CreatedAt   types.String `tfsdk:"created_at"`
 }
@@ -513,10 +515,8 @@ func (r *dnsZoneResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				MarkdownDescription: "The zone's apex, e.g. `example.com`. No update exists, so a change replaces it.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
-			"project_id": schema.StringAttribute{
-				Optional:      true,
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-			},
+			"project_id": projectAttribute("zone"),
+			"tags":       tagsAttribute("zone"),
 			"nameservers": schema.ListAttribute{
 				ElementType:         types.StringType,
 				Computed:            true,
@@ -539,6 +539,10 @@ func (r *dnsZoneResource) Create(ctx context.Context, req resource.CreateRequest
 	body := fbapi.ZoneCreateInputBody{Name: plan.Name.ValueString()}
 	if v := plan.ProjectID.ValueString(); v != "" {
 		body.ProjectId = &v
+	}
+	body.Tags = tagsFromPlan(ctx, plan.Tags, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
 	}
 	out, err := r.client.API.DnsZoneCreateWithResponse(ctx, &fbapi.DnsZoneCreateParams{}, body)
 	if err != nil {
@@ -578,10 +582,52 @@ func (r *dnsZoneResource) Read(ctx context.Context, req resource.ReadRequest, re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-func (r *dnsZoneResource) Update(_ context.Context, _ resource.UpdateRequest, resp *resource.UpdateResponse) {
-	resp.Diagnostics.AddError("DNS zones cannot be updated",
-		"The API has no update endpoint for a zone, so every attribute requires replacement "+
-			"and reaching Update is a bug in the provider. Please report it.")
+// Update handles the two attributes a zone CAN change: its project and its
+// tags. The zone's NAME is still fixed at birth and requires replacement, which
+// is why this used to be an error outright — the grouping endpoints
+// (2026-08-27) are what gave it something to do. That matters here more than
+// elsewhere: replacing a zone deletes its records.
+func (r *dnsZoneResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state dnsZoneModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	id := state.ID.ValueString()
+	if !applyGrouping(ctx, &resp.Diagnostics, groupingUpdate{
+		Noun: "zone", PlanTags: plan.Tags, StateTags: state.Tags,
+		PlanProject: plan.ProjectID, StateProject: state.ProjectID,
+		SetTags: func(ctx context.Context, b fbapi.TagsBody) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.DnsZoneTagsSetWithResponse(ctx, id, b)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+		SetProject: func(ctx context.Context, pid *string) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.DnsZoneProjectSetWithResponse(ctx, id,
+				fbapi.DnsZoneProjectSetJSONRequestBody{ProjectId: pid})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+	}) {
+		return
+	}
+	out, err := r.client.API.DnsZoneGetWithResponse(ctx, id)
+	if err != nil {
+		apiError(&resp.Diagnostics, "Re-reading the DNS zone", err)
+		return
+	}
+	if out.JSON200 == nil {
+		apiError(&resp.Diagnostics, "Re-reading the DNS zone",
+			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
+		return
+	}
+	resp.Diagnostics.Append(applyDNSZone(ctx, &plan, &out.JSON200.Zone)...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *dnsZoneResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {

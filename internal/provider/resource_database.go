@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"net/http"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -38,6 +40,8 @@ type databaseModel struct {
 	Plan          types.String `tfsdk:"plan"`
 	Region        types.String `tfsdk:"region"`
 	NetworkID     types.String `tfsdk:"network_id"`
+	ProjectID     types.String `tfsdk:"project_id"`
+	Tags          types.Set    `tfsdk:"tags"`
 	PublicAccess  types.Bool   `tfsdk:"public_access"`
 	WaitFor       types.Bool   `tfsdk:"wait_for_ready"`
 
@@ -112,6 +116,8 @@ func (r *databaseResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
+			"project_id": projectAttribute("database"),
+			"tags":       tagsAttribute("database"),
 			"network_id": schema.StringAttribute{
 				Optional: true,
 				MarkdownDescription: "Optional private network. Servers on it reach the instance " +
@@ -193,6 +199,13 @@ func (r *databaseResource) Create(ctx context.Context, req resource.CreateReques
 	}
 
 	body := fbapi.DatabaseCreateInputBody{Name: plan.Name.ValueString()}
+	if v := plan.ProjectID.ValueString(); v != "" {
+		body.ProjectId = &v
+	}
+	body.Tags = tagsFromPlan(ctx, plan.Tags, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	if v := plan.Engine.ValueString(); v != "" && !plan.Engine.IsUnknown() {
 		e := fbapi.DatabaseCreateInputBodyEngine(v)
 		body.Engine = &e
@@ -221,7 +234,7 @@ func (r *databaseResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 	id := out.JSON202.Id
-	applyDatabase(&plan, out.JSON202, nil)
+	applyDatabase(ctx, &plan, out.JSON202, nil, &resp.Diagnostics)
 	// State before the wait, and before the two settings below: an interrupted
 	// apply must not leave a billing instance that no state file names.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -275,7 +288,7 @@ func (r *databaseResource) Read(ctx context.Context, req resource.ReadRequest, r
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyDatabase(&state, &out.JSON200.Database, out.JSON200)
+	applyDatabase(ctx, &state, &out.JSON200.Database, out.JSON200, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -287,6 +300,28 @@ func (r *databaseResource) Update(ctx context.Context, req resource.UpdateReques
 		return
 	}
 	id := state.ID.ValueString()
+
+	if !applyGrouping(ctx, &resp.Diagnostics, groupingUpdate{
+		Noun: "database", PlanTags: plan.Tags, StateTags: state.Tags,
+		PlanProject: plan.ProjectID, StateProject: state.ProjectID,
+		SetTags: func(ctx context.Context, b fbapi.TagsBody) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.DatabaseTagsSetWithResponse(ctx, id, b)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+		SetProject: func(ctx context.Context, pid *string) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.DatabaseProjectSetWithResponse(ctx, id,
+				fbapi.DatabaseProjectSetJSONRequestBody{ProjectId: pid})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+	}) {
+		return
+	}
 
 	// Trusted sources before public access, so turning the public address on
 	// never exposes an instance to a list that has not been narrowed yet. The
@@ -401,14 +436,14 @@ func (r *databaseResource) refresh(ctx context.Context, id string, m *databaseMo
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return false
 	}
-	applyDatabase(m, &out.JSON200.Database, out.JSON200)
+	applyDatabase(ctx, m, &out.JSON200.Database, out.JSON200, diags)
 	return true
 }
 
 // applyDatabase fills the model. `detail` is the detail endpoint's body when
 // there is one; a create response carries the instance alone, so the trusted
 // source list is left as configured rather than blanked.
-func applyDatabase(m *databaseModel, b *fbapi.DatabaseBody, detail *fbapi.DatabaseGetOutputBody) {
+func applyDatabase(ctx context.Context, m *databaseModel, b *fbapi.DatabaseBody, detail *fbapi.DatabaseGetOutputBody, diags *diag.Diagnostics) {
 	m.ID = types.StringValue(b.Id)
 	m.Code = types.StringValue(b.Code)
 	m.Name = types.StringValue(b.Name)
@@ -423,6 +458,8 @@ func applyDatabase(m *databaseModel, b *fbapi.DatabaseBody, detail *fbapi.Databa
 	m.Plan = preferAPI(m.Plan, b.PlanSlug)
 	m.Region = preferAPI(m.Region, b.RegionSlug)
 	m.NetworkID = preferAPI(m.NetworkID, b.NetworkId)
+	m.ProjectID = optString(b.ProjectId)
+	applyTags(ctx, &m.Tags, b.Tags, diags)
 
 	if detail == nil {
 		return

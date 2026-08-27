@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -52,6 +53,7 @@ type appModel struct {
 
 	Region    types.String `tfsdk:"region"`
 	ProjectID types.String `tfsdk:"project_id"`
+	Tags      types.Set    `tfsdk:"tags"`
 	Runtime   types.String `tfsdk:"runtime"`
 
 	Image          types.String `tfsdk:"image"`
@@ -123,12 +125,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"stay unknown.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
-			"project_id": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "Optional project to group the app under, set at creation. The API " +
-					"has no endpoint that moves an app between projects, so a change replaces it.",
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-			},
+			"project_id": projectAttribute("app"),
+			"tags":       tagsAttribute("app"),
 			"runtime": schema.StringAttribute{
 				Optional: true,
 				Computed: true,
@@ -343,6 +341,10 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	setIfConfigured(plan.InstallCommand, &body.InstallCommand)
 	setIfConfigured(plan.OutputDir, &body.OutputDir)
 	setIfConfigured(plan.ContextDir, &body.ContextDir)
+	body.Tags = tagsFromPlan(ctx, plan.Tags, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	setIfConfigured(plan.DockerfilePath, &body.DockerfilePath)
 	setIfConfigured(plan.SourceURL, &body.SourceUrl)
 	if v := plan.Port.ValueInt64(); v > 0 && !plan.Port.IsUnknown() {
@@ -375,7 +377,7 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 	code := out.JSON201.Code
-	applyApp(&plan, out.JSON201)
+	applyApp(ctx, &plan, out.JSON201, &resp.Diagnostics)
 	// State before anything else. An app is billed from creation, so an
 	// interrupted apply must not leave one that no state file names.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -433,7 +435,7 @@ func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyApp(&state, out.JSON200)
+	applyApp(ctx, &state, out.JSON200, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -445,6 +447,28 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 		return
 	}
 	code := state.ID.ValueString()
+
+	if !applyGrouping(ctx, &resp.Diagnostics, groupingUpdate{
+		Noun: "app", PlanTags: plan.Tags, StateTags: state.Tags,
+		PlanProject: plan.ProjectID, StateProject: state.ProjectID,
+		SetTags: func(ctx context.Context, b fbapi.TagsBody) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.AppTagsSetWithResponse(ctx, code, b)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+		SetProject: func(ctx context.Context, pid *string) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.AppProjectSetWithResponse(ctx, code,
+				fbapi.AppProjectSetJSONRequestBody{ProjectId: pid})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+	}) {
+		return
+	}
 
 	// Env first. A new variable is almost always a prerequisite of the code
 	// that is about to be deployed, and setting it after the build would deploy
@@ -691,7 +715,7 @@ func (r *appResource) refresh(ctx context.Context, code string, m *appModel, dia
 			out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse)
 		return false
 	}
-	applyApp(m, out.JSON200)
+	applyApp(ctx, m, out.JSON200, diags)
 	return true
 }
 
@@ -700,7 +724,7 @@ func (r *appResource) refresh(ctx context.Context, code string, m *appModel, dia
 // `env` is deliberately untouched: the API does return it, through an endpoint
 // that audits every read, so the configured value stays in state and drift in it
 // is invisible. That is stated on the attribute itself rather than only here.
-func applyApp(m *appModel, b *fbapi.AppBody) {
+func applyApp(ctx context.Context, m *appModel, b *fbapi.AppBody, diags *diagSink) {
 	m.ID = types.StringValue(b.Code)
 	m.Code = types.StringValue(b.Code)
 	m.Name = types.StringValue(b.Name)
@@ -728,6 +752,7 @@ func applyApp(m *appModel, b *fbapi.AppBody) {
 	m.ContextDir = optString(b.ContextDir)
 	m.DockerfilePath = optString(b.DockerfilePath)
 	m.ProjectID = optString(b.ProjectId)
+	applyTags(ctx, &m.Tags, b.Tags, diags)
 	// `plan` is Required, so a null in state after apply is an inconsistent
 	// result rather than a refresh. The field is optional in the response, so
 	// it is only taken when the API actually sent one.

@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -43,6 +44,8 @@ type loadBalancerModel struct {
 	ID               types.String `tfsdk:"id"`
 	Name             types.String `tfsdk:"name"`
 	NetworkID        types.String `tfsdk:"network_id"`
+	ProjectID        types.String `tfsdk:"project_id"`
+	Tags             types.Set    `tfsdk:"tags"`
 	Plan             types.String `tfsdk:"plan"`
 	Region           types.String `tfsdk:"region"`
 	Algorithm        types.String `tfsdk:"algorithm"`
@@ -85,6 +88,8 @@ func (r *loadBalancerResource) Schema(_ context.Context, _ resource.SchemaReques
 					"a NEW public address.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
+			"project_id": projectAttribute("load balancer"),
+			"tags":       tagsAttribute("load balancer"),
 			"network_id": schema.StringAttribute{
 				Required: true,
 				MarkdownDescription: "The private network the load balancer reaches its backends over. " +
@@ -237,6 +242,13 @@ func (r *loadBalancerResource) Create(ctx context.Context, req resource.CreateRe
 		NetworkId:        plan.NetworkID.ValueString(),
 		RestrictBackends: ptr(plan.RestrictBackends.ValueBool()),
 	}
+	if v := plan.ProjectID.ValueString(); v != "" {
+		body.ProjectId = &v
+	}
+	body.Tags = tagsFromPlan(ctx, plan.Tags, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	if v := plan.Plan.ValueString(); v != "" && !plan.Plan.IsUnknown() {
 		body.Plan = &v
 	}
@@ -331,6 +343,28 @@ func (r *loadBalancerResource) Update(ctx context.Context, req resource.UpdateRe
 		return
 	}
 	id := state.ID.ValueString()
+
+	if !applyGrouping(ctx, &resp.Diagnostics, groupingUpdate{
+		Noun: "load balancer", PlanTags: plan.Tags, StateTags: state.Tags,
+		PlanProject: plan.ProjectID, StateProject: state.ProjectID,
+		SetTags: func(ctx context.Context, b fbapi.TagsBody) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.LoadBalancerTagsSetWithResponse(ctx, id, b)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+		SetProject: func(ctx context.Context, pid *string) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.LoadBalancerProjectSetWithResponse(ctx, id,
+				fbapi.LoadBalancerProjectSetJSONRequestBody{ProjectId: pid})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+	}) {
+		return
+	}
 
 	// Backends first, rules second. A rule set that starts forwarding to a port
 	// before the servers behind it are attached would answer with a connection
@@ -449,6 +483,8 @@ func applyLoadBalancer(ctx context.Context, m *loadBalancerModel, b *fbapi.LoadB
 	if b.NetworkId != nil {
 		m.NetworkID = types.StringValue(*b.NetworkId)
 	}
+	m.ProjectID = optString(b.ProjectId)
+	applyTags(ctx, &m.Tags, b.Tags, diags)
 	m.HealthCheck = &lbHealthCheckModel{
 		Protocol:        types.StringValue(healthCheckProtocol(b.HealthCheck.Protocol)),
 		Path:            types.StringValue(healthCheckPath(b.HealthCheck.Path)),

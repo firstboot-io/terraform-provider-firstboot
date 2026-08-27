@@ -236,11 +236,14 @@ func applyDNSZone(ctx context.Context, m *dnsZoneModel, b *fbapi.DnsZoneBody) di
 	m.Name = types.StringValue(b.Name)
 	m.CreatedAt = types.StringValue(b.CreatedAt.Format(timeFormat))
 	m.ProjectID = optString(b.ProjectId)
+	var diags diag.Diagnostics
+	applyTags(ctx, &m.Tags, b.Tags, &diags)
 	var ns []string
 	if b.Nameservers != nil {
 		ns = *b.Nameservers
 	}
-	list, diags := types.ListValueFrom(ctx, types.StringType, ns)
+	list, d := types.ListValueFrom(ctx, types.StringType, ns)
+	diags.Append(d...)
 	m.Nameservers = list
 	return diags
 }

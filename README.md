@@ -58,6 +58,48 @@ Implemented and covered by tests:
 | Data source | `firstboot_plans` |
 | Data source | `firstboot_regions` |
 | Data source | `firstboot_images` |
+| Data source | `firstboot_servers` |
+| Data source | `firstboot_volumes` |
+| Data source | `firstboot_networks` |
+| Data source | `firstboot_databases` |
+| Data source | `firstboot_load_balancers` |
+| Data source | `firstboot_dns_zones` |
+| Data source | `firstboot_apps` |
+| Data source | `firstboot_domains` |
+
+The eight plural data sources select by tag or by project and answer with `ids`
+and `names`. They are why the eight resources carry `tags`: a fleet built with
+`count` should be handed to a load balancer by role rather than enumerated.
+
+```hcl
+resource "firstboot_server" "web" {
+  count = 3
+  name  = "web-${count.index + 1}"
+  plan  = "s1"
+  image = "ubuntu-24-04"
+  tags  = ["env:prod", "role:web"]
+}
+
+data "firstboot_servers" "web" {
+  tags = ["role:web"]
+}
+
+resource "firstboot_load_balancer" "lb" {
+  name        = "web-lb"
+  network_id  = firstboot_network.vpc.id
+  backend_ids = data.firstboot_servers.web.ids
+}
+```
+
+Tags must be written in stored form: lowercase, `[a-z0-9._:-]`, starting with a
+letter or a digit, at most ten of at most thirty-two characters. `Env:Prod` is
+refused at PLAN time rather than quietly rewritten, because the stored value
+would be `env:prod` and your configuration and state would then differ forever.
+
+`tags` and `project_id` are both applied IN PLACE on all eight. Neither may ever
+grow a `RequiresReplace`: four of them had one, back when the API had no
+endpoint to change a project, and it meant destroying a volume and its data to
+move an organizational label.
 
 A resource is registered only once it is implemented: a registered constructor
 that cannot serve panics at apply rather than answering "unsupported resource

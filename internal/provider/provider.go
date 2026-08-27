@@ -161,9 +161,13 @@ func (p *firstbootProvider) Resources(_ context.Context) []func() resource.Resou
 }
 
 func (p *firstbootProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{
+	return append([]func() datasource.DataSource{
 		NewPlansDataSource,
 		NewRegionsDataSource,
 		NewImagesDataSource,
-	}
+	},
+		// The eight plural selectors: firstboot_servers, firstboot_volumes and
+		// so on. They exist so a configuration can name a fleet by what it IS
+		// rather than by listing ids; see data_source_grouped.go.
+		GroupedDataSources()...)
 }

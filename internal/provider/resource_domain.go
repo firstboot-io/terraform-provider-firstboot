@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -48,6 +49,7 @@ type domainModel struct {
 	Years         types.Int64  `tfsdk:"years"`
 	ContactID     types.String `tfsdk:"contact_id"`
 	ProjectID     types.String `tfsdk:"project_id"`
+	Tags          types.Set    `tfsdk:"tags"`
 	AutoRenew     types.Bool   `tfsdk:"auto_renew"`
 	Privacy       types.Bool   `tfsdk:"privacy"`
 	RegistrarLock types.Bool   `tfsdk:"registrar_lock"`
@@ -135,17 +137,16 @@ func (r *domainResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 						"API. It is a registry operation with its own rules, not an attribute edit.",
 				}},
 			},
-			"project_id": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "Optional project to group the domain under, set at registration.\n\n" +
-					"**Cannot be changed here.** The API has no endpoint that moves a domain " +
-					"between projects; move it in the panel and the next refresh picks it up.",
-				PlanModifiers: []planmodifier.String{immutableString{
-					why: "The API has no endpoint that moves a domain between projects, so a change " +
-						"here would be a plan promising something the apply cannot do. Move it in " +
-						"the panel instead.",
-				}},
-			},
+			// Not immutable any more. It was, and the reason was true when it was
+			// written: there was no endpoint that moved a domain between
+			// projects. `PATCH /v1/domains/{id}/project` (2026-08-27) is that
+			// endpoint, so the refusal became a plan blocking something the
+			// apply can now do.
+			//
+			// `name`, `years` and `contact_id` are still immutable, and for a
+			// different reason entirely: a registration cannot be un-bought.
+			"project_id": projectAttribute("domain"),
+			"tags":       tagsAttribute("domain"),
 			"auto_renew": schema.BoolAttribute{
 				Optional: true,
 				Computed: true,
@@ -243,6 +244,10 @@ func (r *domainResource) Create(ctx context.Context, req resource.CreateRequest,
 	if v := plan.ProjectID.ValueString(); v != "" {
 		body.ProjectId = &v
 	}
+	body.Tags = tagsFromPlan(ctx, plan.Tags, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	if !plan.AutoRenew.IsUnknown() && !plan.AutoRenew.IsNull() {
 		body.AutoRenew = ptr(plan.AutoRenew.ValueBool())
 	}
@@ -323,6 +328,27 @@ func (r *domainResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 	id := state.ID.ValueString()
+	if !applyGrouping(ctx, &resp.Diagnostics, groupingUpdate{
+		Noun: "domain", PlanTags: plan.Tags, StateTags: state.Tags,
+		PlanProject: plan.ProjectID, StateProject: state.ProjectID,
+		SetTags: func(ctx context.Context, b fbapi.TagsBody) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.DomainTagsSetWithResponse(ctx, id, b)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+		SetProject: func(ctx context.Context, pid *string) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.DomainProjectSetWithResponse(ctx, id,
+				fbapi.DomainProjectSetJSONRequestBody{ProjectId: pid})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+	}) {
+		return
+	}
 	if !r.applySettings(ctx, id, &plan, &state, &resp.Diagnostics) {
 		return
 	}
@@ -487,6 +513,7 @@ func applyDomain(ctx context.Context, m *domainModel, b *fbapi.DomainBody) diagS
 	m.DNSZoneID = optString(b.DnsZoneId)
 	m.LastErrorCode = optString(b.LastErrorCode)
 	m.ProjectID = optString(b.ProjectId)
+	applyTags(ctx, &m.Tags, b.Tags, &diags)
 	m.RegisteredAt = optTime(b.RegisteredAt)
 	m.ExpiresAt = optTime(b.ExpiresAt)
 	m.TransferableAt = optTime(b.TransferableAt)

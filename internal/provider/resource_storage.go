@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"net/http"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -31,6 +33,7 @@ type volumeModel struct {
 	Name      types.String `tfsdk:"name"`
 	SizeGB    types.Int64  `tfsdk:"size_gb"`
 	ProjectID types.String `tfsdk:"project_id"`
+	Tags      types.Set    `tfsdk:"tags"`
 	ServerID  types.String `tfsdk:"server_id"`
 	FSType    types.String `tfsdk:"fs_type"`
 	Automount types.Bool   `tfsdk:"automount"`
@@ -71,10 +74,8 @@ func (r *volumeResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"Read `firstboot_volume_limits` rather than assuming a band: the minimum and " +
 					"maximum are operator policy with per-account overrides.",
 			},
-			"project_id": schema.StringAttribute{
-				Optional:      true,
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-			},
+			"project_id": projectAttribute("volume"),
+			"tags":       tagsAttribute("volume"),
 			"server_id": schema.StringAttribute{
 				Optional: true,
 				MarkdownDescription: "Server to attach to. Changing this detaches from one server and " +
@@ -140,6 +141,10 @@ func (r *volumeResource) Create(ctx context.Context, req resource.CreateRequest,
 	if v := plan.ProjectID.ValueString(); v != "" {
 		body.ProjectId = &v
 	}
+	body.Tags = tagsFromPlan(ctx, plan.Tags, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	if v := plan.ServerID.ValueString(); v != "" {
 		body.ServerId = &v
 	}
@@ -158,7 +163,7 @@ func (r *volumeResource) Create(ctx context.Context, req resource.CreateRequest,
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyVolume(&plan, out.JSON202)
+	applyVolume(ctx, &plan, out.JSON202, &resp.Diagnostics)
 	// State before the wait, for the same reason as the server: an interrupted
 	// apply must not leave a billing volume that no state file names.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -170,7 +175,7 @@ func (r *volumeResource) Create(ctx context.Context, req resource.CreateRequest,
 		waitError(&resp.Diagnostics, "Waiting for the volume", err)
 		return
 	}
-	applyVolume(&plan, settled)
+	applyVolume(ctx, &plan, settled, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -194,7 +199,7 @@ func (r *volumeResource) Read(ctx context.Context, req resource.ReadRequest, res
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyVolume(&state, out.JSON200)
+	applyVolume(ctx, &state, out.JSON200, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -206,6 +211,28 @@ func (r *volumeResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 	id := state.ID.ValueString()
+
+	if !applyGrouping(ctx, &resp.Diagnostics, groupingUpdate{
+		Noun: "volume", PlanTags: plan.Tags, StateTags: state.Tags,
+		PlanProject: plan.ProjectID, StateProject: state.ProjectID,
+		SetTags: func(ctx context.Context, b fbapi.TagsBody) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.VolumeTagsSetWithResponse(ctx, id, b)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+		SetProject: func(ctx context.Context, pid *string) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.VolumeProjectSetWithResponse(ctx, id,
+				fbapi.VolumeProjectSetJSONRequestBody{ProjectId: pid})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+	}) {
+		return
+	}
 
 	// Resize before the attachment change: growing a volume that is about to
 	// move is the same operation either way, and doing it while it is still on
@@ -277,7 +304,7 @@ func (r *volumeResource) Update(ctx context.Context, req resource.UpdateRequest,
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyVolume(&plan, out.JSON200)
+	applyVolume(ctx, &plan, out.JSON200, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -302,7 +329,7 @@ func (r *volumeResource) ImportState(ctx context.Context, req resource.ImportSta
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
-func applyVolume(m *volumeModel, b *fbapi.VolumeBody) {
+func applyVolume(ctx context.Context, m *volumeModel, b *fbapi.VolumeBody, diags *diag.Diagnostics) {
 	m.ID = types.StringValue(b.Id)
 	m.Name = types.StringValue(b.Name)
 	m.SizeGB = types.Int64Value(b.SizeGb)
@@ -313,6 +340,12 @@ func applyVolume(m *volumeModel, b *fbapi.VolumeBody) {
 	m.MountPath = optString(b.MountPath)
 	m.FSType = optString(b.FsType)
 	m.ServerID = optString(b.ServerId)
+	if b.ProjectId != nil && *b.ProjectId != "" {
+		m.ProjectID = types.StringValue(*b.ProjectId)
+	} else {
+		m.ProjectID = types.StringNull()
+	}
+	applyTags(ctx, &m.Tags, b.Tags, diags)
 }
 
 // ============================== network ==============================
@@ -332,6 +365,7 @@ type networkModel struct {
 	Name      types.String `tfsdk:"name"`
 	CIDR      types.String `tfsdk:"cidr"`
 	ProjectID types.String `tfsdk:"project_id"`
+	Tags      types.Set    `tfsdk:"tags"`
 	State     types.String `tfsdk:"state"`
 	CreatedAt types.String `tfsdk:"created_at"`
 }
@@ -362,10 +396,8 @@ func (r *networkResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 					"referencing the network wait for it: provisioning does not race it.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
-			"project_id": schema.StringAttribute{
-				Optional:      true,
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-			},
+			"project_id": projectAttribute("network"),
+			"tags":       tagsAttribute("network"),
 			"state": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "`active` or `error` are settled; `creating` and `deleting` are in flight.",
@@ -388,6 +420,10 @@ func (r *networkResource) Create(ctx context.Context, req resource.CreateRequest
 	if v := plan.ProjectID.ValueString(); v != "" {
 		body.ProjectId = &v
 	}
+	body.Tags = tagsFromPlan(ctx, plan.Tags, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	out, err := r.client.API.NetworkCreateWithResponse(ctx, &fbapi.NetworkCreateParams{}, body)
 	if err != nil {
 		apiError(&resp.Diagnostics, "Creating the network", err)
@@ -398,7 +434,7 @@ func (r *networkResource) Create(ctx context.Context, req resource.CreateRequest
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyNetwork(&plan, out.JSON201)
+	applyNetwork(ctx, &plan, out.JSON201, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -422,14 +458,55 @@ func (r *networkResource) Read(ctx context.Context, req resource.ReadRequest, re
 			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
 		return
 	}
-	applyNetwork(&state, &out.JSON200.Network)
+	applyNetwork(ctx, &state, &out.JSON200.Network, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-func (r *networkResource) Update(_ context.Context, _ resource.UpdateRequest, resp *resource.UpdateResponse) {
-	resp.Diagnostics.AddError("Private networks cannot be updated",
-		"The API has no update endpoint for a network, so every attribute requires replacement "+
-			"and reaching Update is a bug in the provider. Please report it.")
+// Update handles the two attributes a network CAN change: its project and its
+// tags. Everything else about a network is fixed at birth and requires
+// replacement, which is why this used to be an error — the grouping endpoints
+// (2026-08-27) are what gave it something to do.
+func (r *networkResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state networkModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	id := state.ID.ValueString()
+	if !applyGrouping(ctx, &resp.Diagnostics, groupingUpdate{
+		Noun: "network", PlanTags: plan.Tags, StateTags: state.Tags,
+		PlanProject: plan.ProjectID, StateProject: state.ProjectID,
+		SetTags: func(ctx context.Context, b fbapi.TagsBody) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.NetworkTagsSetWithResponse(ctx, id, b)
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+		SetProject: func(ctx context.Context, pid *string) (int, *fbapi.ErrorModel, http.Header, error) {
+			out, err := r.client.API.NetworkProjectSetWithResponse(ctx, id,
+				fbapi.NetworkProjectSetJSONRequestBody{ProjectId: pid})
+			if err != nil {
+				return 0, nil, nil, err
+			}
+			return out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header, nil
+		},
+	}) {
+		return
+	}
+	out, err := r.client.API.NetworkGetWithResponse(ctx, id)
+	if err != nil {
+		apiError(&resp.Diagnostics, "Re-reading the network", err)
+		return
+	}
+	if out.JSON200 == nil {
+		apiError(&resp.Diagnostics, "Re-reading the network",
+			problem(out.StatusCode(), out.ApplicationproblemJSONDefault, out.HTTPResponse.Header))
+		return
+	}
+	applyNetwork(ctx, &plan, &out.JSON200.Network, &resp.Diagnostics)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *networkResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -453,11 +530,12 @@ func (r *networkResource) ImportState(ctx context.Context, req resource.ImportSt
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
-func applyNetwork(m *networkModel, b *fbapi.NetworkBody) {
+func applyNetwork(ctx context.Context, m *networkModel, b *fbapi.NetworkBody, diags *diag.Diagnostics) {
 	m.ID = types.StringValue(b.Id)
 	m.Name = types.StringValue(b.Name)
 	m.CIDR = types.StringValue(b.Cidr)
 	m.State = types.StringValue(string(b.State))
 	m.CreatedAt = types.StringValue(b.CreatedAt.Format(timeFormat))
 	m.ProjectID = optString(b.ProjectId)
+	applyTags(ctx, &m.Tags, b.Tags, diags)
 }

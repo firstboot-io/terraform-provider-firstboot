@@ -7,9 +7,12 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	dsschema "github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	fwprovider "github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	rschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
 // Schema-level tests, deliberately without a live API.
@@ -119,15 +122,21 @@ func TestImmutableResourcesRequireReplacement(t *testing.T) {
 		name  string
 		attrs []string
 	}{
-		// No update endpoint exists for either, so every configurable
-		// attribute has to force replacement.
-		{NewNetworkResource, "firstboot_network", []string{"name", "cidr", "project_id"}},
-		{NewDNSZoneResource, "firstboot_dns_zone", []string{"name", "project_id"}},
+		// Neither has an update endpoint for what it IS, so every attribute
+		// describing the thing itself has to force replacement.
+		//
+		// `project_id` and `tags` came OFF these lists on 2026-08-27, when the
+		// grouping endpoints shipped: a change to either is now applied in
+		// place. Leaving them here would have kept forcing a replacement that
+		// deletes a private network, or a DNS zone and every record in it, to
+		// change an organizational label.
+		{NewNetworkResource, "firstboot_network", []string{"name", "cidr"}},
+		{NewDNSZoneResource, "firstboot_dns_zone", []string{"name"}},
 		// A volume has a resize and an attach, so only the write-once halves
 		// belong here. fs_type is the sharp one: a volume is formatted at birth
 		// and never again, because afterwards nothing can honestly answer
 		// whether the disk holds data.
-		{NewVolumeResource, "firstboot_volume", []string{"name", "fs_type", "project_id"}},
+		{NewVolumeResource, "firstboot_volume", []string{"name", "fs_type"}},
 		// The record's identity fields: the API's update changes content and
 		// ttl, and nothing else.
 		{NewDNSRecordResource, "firstboot_dns_record", []string{"zone_id", "name", "type"}},
@@ -145,8 +154,9 @@ func TestImmutableResourcesRequireReplacement(t *testing.T) {
 		{NewDatabaseResource, "firstboot_database",
 			[]string{"name", "engine", "engine_version", "region", "network_id"}},
 		// An app's placement. Its name, plan, scale and source all have their
-		// own endpoints; these three do not.
-		{NewAppResource, "firstboot_app", []string{"region", "project_id", "runtime"}},
+		// own endpoints; these two do not. `project_id` left this list with the
+		// grouping endpoints (2026-08-27).
+		{NewAppResource, "firstboot_app", []string{"region", "runtime"}},
 		// An ISO has a create, a read and a delete and nothing else.
 		{NewISOResource, "firstboot_iso", []string{"name", "url", "checksum"}},
 		// Which address a PTR is for. The hostname is the only editable half.
@@ -224,7 +234,14 @@ func TestDomainIdentityRefusesChangeRatherThanReplacing(t *testing.T) {
 	var got resource.SchemaResponse
 	NewDomainResource().Schema(ctx, resource.SchemaRequest{}, &got)
 
-	for _, name := range []string{"name", "years", "contact_id", "project_id"} {
+	// `project_id` is deliberately NOT in this list any more. It was, and the
+	// reason was true: there was no endpoint that moved a domain between
+	// projects, so a change could neither be applied nor safely replaced. The
+	// endpoint exists since 2026-08-27, which leaves only the three attributes
+	// that are immutable because the REGISTRATION is: a name that was bought,
+	// the term it was bought for, and the registrant it was bought in the name
+	// of.
+	for _, name := range []string{"name", "years", "contact_id"} {
 		attr, ok := got.Schema.Attributes[name]
 		if !ok {
 			t.Errorf("firstboot_domain has no %q attribute", name)
@@ -305,3 +322,121 @@ func TestConfigureToleratesNilProviderData(t *testing.T) {
 }
 
 var _ = dsschema.Schema{}
+
+// Every groupable resource has both axes, and both are in-place.
+//
+// This is the mirror of what TestImmutableResourcesRequireReplacement stopped
+// asserting on 2026-08-27. `project_id` used to force replacement on four
+// resources and refuse a change on a fifth, each with a comment saying the API
+// had no endpoint for it. The endpoints exist now, and the danger runs the
+// other way: a `RequiresReplace` reintroduced here would destroy a volume and
+// its data, or a DNS zone and its records, to change an organizational label.
+func TestGroupableResourcesCarryBothAxesInPlace(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		res  func() resource.Resource
+		name string
+	}{
+		{NewServerResource, "firstboot_server"},
+		{NewVolumeResource, "firstboot_volume"},
+		{NewNetworkResource, "firstboot_network"},
+		{NewDatabaseResource, "firstboot_database"},
+		{NewLoadBalancerResource, "firstboot_load_balancer"},
+		{NewDNSZoneResource, "firstboot_dns_zone"},
+		{NewAppResource, "firstboot_app"},
+		{NewDomainResource, "firstboot_domain"},
+	} {
+		var got resource.SchemaResponse
+		c.res().Schema(ctx, resource.SchemaRequest{}, &got)
+		for _, name := range []string{"tags", "project_id"} {
+			attr, ok := got.Schema.Attributes[name]
+			if !ok {
+				t.Errorf("%s has no %q attribute, but the API can group it", c.name, name)
+				continue
+			}
+			if hasRequiresReplace(attr) {
+				t.Errorf("%s.%s forces replacement.\n"+
+					"  Both grouping axes are applied in place (PUT .../tags, PATCH .../project). "+
+					"Replacing a resource to change a label destroys it.", c.name, name)
+			}
+			if refusesChange(attr) {
+				t.Errorf("%s.%s refuses a change.\n"+
+					"  The endpoint exists; refusing makes a plan block something the apply can do.",
+					c.name, name)
+			}
+		}
+	}
+}
+
+// A tag is refused at PLAN time when it is not already in stored form.
+//
+// The API lowercases what it stores, so `Env:Prod` would come back `env:prod`
+// and the configuration would disagree with state on every subsequent plan --
+// a diff nothing can resolve. Refusing is the only honest answer; rewriting the
+// value silently would be the other one, and it is worse.
+func TestTagValidatorRefusesWhatWouldNeverSettle(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name string
+		tags []string
+		ok   bool
+	}{
+		{"lowercase", []string{"env:prod", "role:web"}, true},
+		{"dotted and dashed", []string{"team.billing", "tier-1"}, true},
+		{"uppercase", []string{"Env:Prod"}, false},
+		{"space", []string{"env prod"}, false},
+		{"leading dash", []string{"-env"}, false},
+		{"too long", []string{strings.Repeat("a", 33)}, false},
+		{"eleven", []string{"a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "b1", "b2"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			set, diags := types.SetValueFrom(ctx, types.StringType, c.tags)
+			if diags.HasError() {
+				t.Fatalf("building the set: %v", diags)
+			}
+			var resp validator.SetResponse
+			tagSetValidator{}.ValidateSet(ctx, validator.SetRequest{
+				Path: path.Root("tags"), ConfigValue: set,
+			}, &resp)
+			if got := !resp.Diagnostics.HasError(); got != c.ok {
+				t.Fatalf("accepted=%v, want %v (%v)", got, c.ok, resp.Diagnostics)
+			}
+		})
+	}
+}
+
+// Every groupable kind has a plural data source, and every one of them takes
+// both filters. Seven of eight would make the eighth look unsupported, and the
+// one that gets forgotten is whichever kind was added last.
+func TestEveryGroupableKindHasASelector(t *testing.T) {
+	ctx := context.Background()
+	want := map[string]bool{
+		"firstboot_servers": false, "firstboot_volumes": false,
+		"firstboot_networks": false, "firstboot_databases": false,
+		"firstboot_load_balancers": false, "firstboot_dns_zones": false,
+		"firstboot_apps": false, "firstboot_domains": false,
+	}
+	for _, mk := range GroupedDataSources() {
+		ds := mk()
+		var meta datasource.MetadataResponse
+		ds.Metadata(ctx, datasource.MetadataRequest{ProviderTypeName: "firstboot"}, &meta)
+		if _, ok := want[meta.TypeName]; !ok {
+			t.Errorf("%s is a selector for a kind that is not groupable", meta.TypeName)
+			continue
+		}
+		want[meta.TypeName] = true
+
+		var got datasource.SchemaResponse
+		ds.Schema(ctx, datasource.SchemaRequest{}, &got)
+		for _, attr := range []string{"tags", "project_id", "ids", "names"} {
+			if _, ok := got.Schema.Attributes[attr]; !ok {
+				t.Errorf("%s has no %q attribute", meta.TypeName, attr)
+			}
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("%s is missing: the kind can be tagged but not selected", name)
+		}
+	}
+}
