@@ -20,19 +20,6 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with: {go-version: '1.25'}
-      - name: reach the SDK module
-        env:
-          SDK_READ_TOKEN: ${{ secrets.SDK_READ_TOKEN }}
-        run: |
-          if [ -n "$SDK_READ_TOKEN" ]; then
-            git config --global \
-              url."https://x-access-token:${SDK_READ_TOKEN}@github.com/firstboot-io/".insteadOf \
-              "https://github.com/firstboot-io/"
-            echo "GOPRIVATE=github.com/firstboot-io/*" >> "$GITHUB_ENV"
-          fi
-      # The signing key lives here and nowhere else. Its public half is uploaded
-      # to the registry once; the registry then refuses any version this key did
-      # not sign, which is the whole point of it.
       - uses: crazy-max/ghaction-import-gpg@v6
         id: import_gpg
         with:
