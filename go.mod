@@ -5,7 +5,7 @@ go 1.25.7
 // firstboot-go is not published yet; it is checked out as a sibling of this
 // repository, exactly as the workspace layout describes. Remove this the day
 // the SDK carries a tag.
-replace github.com/firstboot-io/firstboot-go => ../firstboot-go
+replace github.com/firstboot-io/firstboot-go => ../go-sdk
 
 require (
 	github.com/firstboot-io/firstboot-go v0.0.0-00010101000000-000000000000
