@@ -20,7 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
-	firstboot "github.com/firstboot-io/firstboot-go"
+	firstboot "github.com/firstboot-io/go-sdk"
 )
 
 // Ensure the implementation satisfies the interfaces the framework dispatches

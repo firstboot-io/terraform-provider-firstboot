@@ -7,7 +7,7 @@ import (
 	dschema "github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
-	firstboot "github.com/firstboot-io/firstboot-go"
+	firstboot "github.com/firstboot-io/go-sdk"
 )
 
 // The plural data sources: SELECT resources by what they are, not by listing

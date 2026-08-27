@@ -14,8 +14,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
-	firstboot "github.com/firstboot-io/firstboot-go"
-	"github.com/firstboot-io/firstboot-go/fbapi"
+	firstboot "github.com/firstboot-io/go-sdk"
+	"github.com/firstboot-io/go-sdk/fbapi"
 )
 
 // Shared plumbing. Every resource needs the same three things and getting any
