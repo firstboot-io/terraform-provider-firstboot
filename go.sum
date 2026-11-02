@@ -11,8 +11,8 @@ github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8Yc
 github.com/fatih/color v1.13.0/go.mod h1:kLAiJbzzSOZDVNGyDpeOxJ47H46qBXwg5ILebYFFOfk=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=
 github.com/fatih/color v1.19.0/go.mod h1:zNk67I0ZUT1bEGsSGyCZYZNrHuTkJJB+r6Q9VuMi0LE=
-github.com/firstboot-io/go-sdk v0.2.0 h1:nTCaF++bBXyqCH0AZRmp3caUqsdhZ+1HqSH/5Xj6j4o=
-github.com/firstboot-io/go-sdk v0.2.0/go.mod h1:QJn/5a12mWWCxVFw5gIZp3Cw6tXKAQuQM+HTi1gJ9rg=
+github.com/firstboot-io/go-sdk v0.3.0 h1:fiAEx+nzXlfwl/OtkTUFYBgkB/4DWVq8/nKRpreYx10=
+github.com/firstboot-io/go-sdk v0.3.0/go.mod h1:z1zhYBxJ6/n6aXjn/xzRZ2oPxN9ScFybLCUfbNX/hiI=
 github.com/golang/protobuf v1.5.4 h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek=
 github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6rSs7xps=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=

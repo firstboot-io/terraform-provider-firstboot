@@ -3,7 +3,7 @@ module github.com/firstboot-io/terraform-provider-firstboot
 go 1.27.3
 
 require (
-	github.com/firstboot-io/go-sdk v0.2.0
+	github.com/firstboot-io/go-sdk v0.3.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
 )
